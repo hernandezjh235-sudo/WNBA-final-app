@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA ODDSAPI CLEAN v1.6 AUTO PLAYER BOARD"
+APP_VERSION = "WNBA ODDSAPI CLEAN v1.7 NO LINE CARD FIX"
 DEFAULT_ODDS_API_KEY = "c9f5eadbe263f64c3fd17df20a4f1f3b"
 
 SPORT_KEY = "basketball_wnba"
@@ -946,32 +946,70 @@ def render_player_cards(df, max_cards=200):
     if df.empty:
         st.info("No props match your filters.")
         return
+
+    def fmt_num(value, digits=2, signed=False):
+        try:
+            if value is None or pd.isna(value):
+                return "—"
+            f = float(value)
+            return f"{f:+.{digits}f}" if signed else f"{f:.{digits}f}"
+        except Exception:
+            return "—"
+
+    def fmt_pct(value):
+        try:
+            if value is None or pd.isna(value):
+                return "—"
+            return f"{float(value):.1f}%"
+        except Exception:
+            return "—"
+
     for _, row in df.head(max_cards).iterrows():
-        sig = row["Signal"]
+        sig = row.get("Signal", "NO LINE")
         card = "green-card" if sig in ["ELITE WATCH", "PASS"] else "warn-card" if sig == "LEAN" else "clean-card"
         badge = "good-badge" if sig in ["ELITE WATCH", "PASS"] else "yellow-badge" if sig == "LEAN" else "red-badge"
         alt_badge = '<span class="badge yellow-badge">ALT LINE</span>' if row.get("Alt Line") else ""
+
+        line_display = row.get("Line", "No Line")
+        book_line_display = row.get("Book Line", line_display)
+        consensus_display = row.get("Consensus Line", line_display)
+        projection_display = fmt_num(row.get("Projection"), 2)
+        edge_display = fmt_num(row.get("Edge"), 2, signed=True)
+        fair_prob_display = fmt_pct(row.get("Fair Prob"))
+        ev_display = fmt_pct(row.get("EV"))
+        rating_display = row.get("Overall Rating", row.get("Data Score", "—"))
+        market_conf = row.get("Market Confidence", "—")
+        volatility = row.get("Volatility", "—")
+        over_price = row.get("Over Price", "—")
+        under_price = row.get("Under Price", "—")
+        clv_delta = row.get("CLV Δ", "—")
+        line_delta = row.get("Line Δ", "—")
+        kelly = row.get("Kelly", "—")
+        steam = row.get("Steam Signal", "—")
+        protection = row.get("Protection Tag", "—")
+        manual_active = row.get("Manual Line Active", False)
+
         st.markdown(f"""
         <div class="{card}">
             <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;">
                 <div>
-                    <div style="font-size:23px;font-weight:950;">{row['Player']}</div>
-                    <div class="small-muted">{row.get('Game Day','')} • {row['Matchup']} • {row['Market Label']} • {row['Book']}</div>
+                    <div style="font-size:23px;font-weight:950;">{row.get('Player','')}</div>
+                    <div class="small-muted">{row.get('Game Day','')} • {row.get('Matchup','')} • {row.get('Market Label','')} • {row.get('Book','')}</div>
                 </div>
                 <div><span class="badge {badge}">{sig}</span>{alt_badge}</div>
             </div>
             <div class="kpi-strip">
-                <div class="kpi-box"><div class="kpi-label">Projection</div><div class="kpi-value">{row['Projection']}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Line</div><div class="kpi-value">{row['Line']}</div><div class="kpi-sub">Book {row.get('Book Line', row['Line'])} • Consensus {row['Consensus Line']}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Edge</div><div class="kpi-value">{row['Edge']:+.2f}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Pick</div><div class="kpi-value">{row['Pick']}</div></div>
-                <div class="kpi-box"><div class="kpi-label">Fair Prob</div><div class="kpi-value">{row['Fair Prob']}%</div><div class="kpi-sub">EV {row['EV']}%</div></div>
-                <div class="kpi-box"><div class="kpi-label">Rating</div><div class="kpi-value">{row.get('Overall Rating', row['Data Score'])}/100</div><div class="kpi-sub">Mkt {row.get('Market Confidence','-')} • {row.get('Volatility','-')}</div></div>
+                <div class="kpi-box"><div class="kpi-label">Projection</div><div class="kpi-value">{projection_display}</div></div>
+                <div class="kpi-box"><div class="kpi-label">Line</div><div class="kpi-value">{line_display}</div><div class="kpi-sub">Book {book_line_display} • Consensus {consensus_display}</div></div>
+                <div class="kpi-box"><div class="kpi-label">Edge</div><div class="kpi-value">{edge_display}</div></div>
+                <div class="kpi-box"><div class="kpi-label">Pick</div><div class="kpi-value">{row.get('Pick','NO LINE')}</div></div>
+                <div class="kpi-box"><div class="kpi-label">Fair Prob</div><div class="kpi-value">{fair_prob_display}</div><div class="kpi-sub">EV {ev_display}</div></div>
+                <div class="kpi-box"><div class="kpi-label">Rating</div><div class="kpi-value">{rating_display}/100</div><div class="kpi-sub">Mkt {market_conf} • {volatility}</div></div>
             </div>
-            <div class="small-muted"><b>Prices:</b> Over {row.get('Over Price')} / Under {row.get('Under Price')} • <b>CLV Δ:</b> {row['CLV Δ']} • <b>Line Δ:</b> {row['Line Δ']} • <b>Steam:</b> {row.get('Steam Signal','STABLE')} • <b>Kelly:</b> {row['Kelly']}%</div>
-            <div class="small-muted"><b>Protection:</b> {row.get('Protection Tag','-')} • <b>Volatility:</b> {row.get('Volatility','-')} • <b>Market Confidence:</b> {row.get('Market Confidence','-')}/100 • <b>Manual Line:</b> {row.get('Manual Line Active', False)}</div>
-            <div class="small-muted"><b>Risk:</b> {row['Risk Notes']}</div>
-            <div class="small-muted"><b>Model:</b> {row['Projection Notes']}</div>
+            <div class="small-muted"><b>Prices:</b> Over {over_price} / Under {under_price} • <b>CLV Δ:</b> {clv_delta} • <b>Line Δ:</b> {line_delta} • <b>Steam:</b> {steam} • <b>Kelly:</b> {kelly}%</div>
+            <div class="small-muted"><b>Protection:</b> {protection} • <b>Volatility:</b> {volatility} • <b>Market Confidence:</b> {market_conf}/100 • <b>Manual Line:</b> {manual_active}</div>
+            <div class="small-muted"><b>Risk:</b> {row.get('Risk Notes','')}</div>
+            <div class="small-muted"><b>Model:</b> {row.get('Projection Notes','')}</div>
         </div>
         """, unsafe_allow_html=True)
 
