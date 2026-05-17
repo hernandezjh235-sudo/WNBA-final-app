@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA ODDSAPI CLEAN v2.0 UNDERDOG LINE PICK FIX"
+APP_VERSION = "WNBA ODDSAPI CLEAN v2.1 CLV NONE FIX"
 DEFAULT_ODDS_API_KEY = "c9f5eadbe263f64c3fd17df20a4f1f3b"
 
 SPORT_KEY = "basketball_wnba"
@@ -530,6 +530,9 @@ def estimate_projection(row, db):
 def update_clv_snapshot(player, market, book, line):
     data = load_json(CLV_FILE, {})
     key = f"{today_str()}::{normalize_name(player)}::{market}::{book}"
+    line = safe_float(line)
+    if line is None:
+        return 0.0
     line = float(line)
     old = data.get(key)
     if not old:
@@ -545,6 +548,9 @@ def update_clv_snapshot(player, market, book, line):
 def track_line_history(player, market, book, line):
     hist = load_json(LINE_HISTORY_FILE, {})
     key = f"{normalize_name(player)}::{market}::{book}"
+    line = safe_float(line)
+    if line is None:
+        return 0.0
     rows = hist.get(key, [])
     rows.append({"t": now_iso(), "line": safe_float(line)})
     hist[key] = rows[-40:]
@@ -851,8 +857,9 @@ def build_board(prop_rows, db):
             edge_val = None
             abs_edge_val = None
         else:
-            clv_delta = update_clv_snapshot(player, r["Market"], r["Book"], original_line)
-            line_delta = track_line_history(player, r["Market"], r["Book"], original_line)
+            tracking_line = line if manual_line is not None else original_line
+            clv_delta = update_clv_snapshot(player, r["Market"], r["Book"], tracking_line)
+            line_delta = track_line_history(player, r["Market"], r["Book"], tracking_line)
 
             book_count = safe_int(r.get("Book Count"), 1) or 1
             alt_line = bool(r.get("Alt Line"))
