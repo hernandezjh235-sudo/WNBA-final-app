@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA ODDSAPI CLEAN v1.7 NO LINE CARD FIX"
+APP_VERSION = "WNBA ODDSAPI CLEAN v1.8 TAB FIX"
 DEFAULT_ODDS_API_KEY = "c9f5eadbe263f64c3fd17df20a4f1f3b"
 
 SPORT_KEY = "basketball_wnba"
