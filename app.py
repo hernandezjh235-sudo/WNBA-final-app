@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA ODDSAPI CLEAN v1.5 MANUAL PROP BOARD"
+APP_VERSION = "WNBA ODDSAPI CLEAN v1.6 AUTO PLAYER BOARD"
 DEFAULT_ODDS_API_KEY = "c9f5eadbe263f64c3fd17df20a4f1f3b"
 
 SPORT_KEY = "basketball_wnba"
@@ -729,50 +729,149 @@ def protection_tag(signal, volatility, market_confidence, edge, fair_prob):
     return "PROTECTED NO BET"
 
 
+
+def default_market_for_projection_board():
+    return ["player_points", "player_rebounds", "player_assists", "player_threes", "player_points_rebounds_assists"]
+
+def projection_only_rows_from_db(db, events=None, selected_markets=None):
+    """Create automatic player cards even when no sportsbook player props are returned.
+
+    These rows do not invent sportsbook lines. They show projection cards with Line=None.
+    If real lines come in later, normal real-line cards will appear.
+    """
+    rows = []
+    markets = selected_markets or default_market_for_projection_board()
+    matchup = "Projection Board"
+    game_day = "Today"
+    if events:
+        try:
+            first = events[0]
+            matchup = f"{first.get('away_team','')} @ {first.get('home_team','')}".strip(" @") or "Projection Board"
+            game_day = utc_to_local_day_label(first.get("commence_time", ""))
+        except Exception:
+            pass
+
+    for player, stats in db.items():
+        if is_bad_player_name(player):
+            continue
+        for market in markets:
+            if market not in MARKET_MAP:
+                continue
+            proj_val = market_stat_value(stats, market)
+            if proj_val is None:
+                continue
+            rows.append({
+                "Event ID": "projection_board",
+                "Game Day": game_day,
+                "Commence Time": "",
+                "Matchup": matchup,
+                "Home Team": "",
+                "Away Team": "",
+                "Book": "No Line Yet",
+                "Book Key": "projection_board",
+                "Market": market,
+                "Market Label": MARKET_MAP.get(market, market),
+                "Player": player,
+                "Line": None,
+                "Price": -110,
+                "Over Price": None,
+                "Under Price": None,
+                "Source": "Projection Board",
+                "Real Line": False,
+                "Book Count": 0,
+                "Consensus Line": None,
+                "Books": "No sportsbook line",
+                "Alt Line": False,
+                "Projection Only": True,
+            })
+    return rows
+
+
 def build_board(prop_rows, db):
     board = []
     for r in prop_rows:
         player = r["Player"]
         if is_bad_player_name(player): continue
         original_line = safe_float(r.get("Line"))
-        if original_line is None: continue
+        projection_only = bool(r.get("Projection Only")) or original_line is None
 
         manual_line, manual_note, manual_scope = get_manual_line_override(player, r["Market"], r.get("Book", ""))
         line = manual_line if manual_line is not None else original_line
 
-        # IMPORTANT:
-        # Projection is calculated from the original sportsbook line context,
-        # not from manual line overrides. Manual lines only affect edge/pick/EV/rating.
-        proj, std, data_score, proj_notes = estimate_projection(r, db)
-        if manual_line is not None:
-            proj_notes += f"; Manual line override active ({manual_scope}) — projection unchanged"
+        # Projection is calculated from the projection DB and is not changed by manual lines.
+        if projection_only:
+            # For no-line cards, calculate projection directly from DB without market anchoring.
+            stats, match_score, matched_name = lookup_projection_stats(player, db)
+            if stats:
+                base = market_stat_value(stats, r["Market"])
+                pace = safe_float(stats.get("pace", stats.get("pace_factor", 1.0)), 1.0) or 1.0
+                dvp = safe_float(stats.get("dvp", stats.get("dvp_adjustment", 1.0)), 1.0) or 1.0
+                proj = float(base or 0) * pace * dvp
+                data_score = 78 + int(min(12, match_score * 12))
+                proj_notes = f"Projection board only: {matched_name} ({match_score:.2f}); no sportsbook line returned yet"
+            else:
+                proj, data_score, proj_notes = 0.0, 30, "Projection board only; no stat match"
+            proj, learn_note = apply_learning(player, r["Market"], proj)
+            proj_notes += f"; {learn_note}"
+            std = MARKET_STD.get(r["Market"], 4.5)
+            side = "NO LINE"
+            prob = 0.50
+        else:
+            # IMPORTANT:
+            # Projection is calculated from the original sportsbook line context,
+            # not from manual line overrides. Manual lines only affect edge/pick/EV/rating.
+            proj, std, data_score, proj_notes = estimate_projection(r, db)
+            if manual_line is not None:
+                proj_notes += f"; Manual line override active ({manual_scope}) — projection unchanged"
+            side = "OVER" if proj > line else "UNDER"
+            prob = normal_side_probability(proj, line, std, side)
+        if projection_only:
+            price = None
+            ev = None
+            kelly = 0.0
+        else:
+            price = safe_float(r.get("Over Price" if side == "OVER" else "Under Price"), safe_float(r.get("Price"), -110)) or -110
+            ev = expected_value(prob, price)
+            kelly = min(kelly_fraction(prob, price), 0.02)
+        if projection_only:
+            clv_delta = 0.0
+            line_delta = 0.0
+            book_count = 0
+            alt_line = False
+            mkt_conf = 0
+            volatility = "NO LINE"
+            signal = "NO LINE"
+            risk_notes = ["No sportsbook/player-prop line returned yet"]
+            steam = "NO LINE"
+            overall_rating = round(clamp(data_score * 0.55, 0, 100), 1)
+            protect = "PROJECTION ONLY"
+            edge_val = None
+            abs_edge_val = None
+        else:
+            clv_delta = update_clv_snapshot(player, r["Market"], r["Book"], original_line)
+            line_delta = track_line_history(player, r["Market"], r["Book"], original_line)
 
-        side = "OVER" if proj > line else "UNDER"
-        prob = normal_side_probability(proj, line, std, side)
-        price = safe_float(r.get("Over Price" if side == "OVER" else "Under Price"), safe_float(r.get("Price"), -110)) or -110
-        ev = expected_value(prob, price)
-        kelly = min(kelly_fraction(prob, price), 0.02)
-        clv_delta = update_clv_snapshot(player, r["Market"], r["Book"], original_line)
-        line_delta = track_line_history(player, r["Market"], r["Book"], original_line)
+            book_count = safe_int(r.get("Book Count"), 1) or 1
+            alt_line = bool(r.get("Alt Line"))
+            mkt_conf = market_confidence_score(book_count, alt_line, r.get("Over Price"), r.get("Under Price"), clv_delta, line_delta)
+            volatility = volatility_rating(r["Market"], line, data_score, book_count, alt_line)
 
-        book_count = safe_int(r.get("Book Count"), 1) or 1
-        alt_line = bool(r.get("Alt Line"))
-        mkt_conf = market_confidence_score(book_count, alt_line, r.get("Over Price"), r.get("Under Price"), clv_delta, line_delta)
-        volatility = volatility_rating(r["Market"], line, data_score, book_count, alt_line)
+            signal, risk_notes = classify_signal(proj, line, prob, ev, data_score, book_count, alt_line)
 
-        signal, risk_notes = classify_signal(proj, line, prob, ev, data_score, book_count, alt_line)
-
-        steam = steam_signal(proj - line, line_delta, clv_delta, side)
-        overall_rating = overall_prop_rating(data_score, mkt_conf, round(prob * 100, 1), abs(proj - line), volatility, signal)
-        protect = protection_tag(signal, volatility, mkt_conf, abs(proj - line), round(prob * 100, 1))
+            steam = steam_signal(proj - line, line_delta, clv_delta, side)
+            overall_rating = overall_prop_rating(data_score, mkt_conf, round(prob * 100, 1), abs(proj - line), volatility, signal)
+            protect = protection_tag(signal, volatility, mkt_conf, abs(proj - line), round(prob * 100, 1))
+            edge_val = round(proj - line, 2)
+            abs_edge_val = round(abs(proj - line), 2)
 
         board.append({
             "Player": player, "Game Day": r.get("Game Day", "Unknown"), "Matchup": r.get("Matchup", ""),
             "Book": r.get("Book", ""), "Books": r.get("Books", r.get("Book", "")), "Book Count": r.get("Book Count", 1),
             "Market": r["Market"], "Market Label": r.get("Market Label", MARKET_MAP.get(r["Market"], r["Market"])),
-            "Line": line, "Book Line": original_line, "Manual Line Active": manual_line is not None,
-            "Manual Line Note": manual_note, "Consensus Line": r.get("Consensus Line", original_line), "Projection": round(proj, 2),
-            "Edge": round(proj - line, 2), "Abs Edge": round(abs(proj - line), 2), "Pick": side,
+            "Line": line if line is not None else "No Line", "Book Line": original_line if original_line is not None else "No Line",
+            "Manual Line Active": manual_line is not None, "Projection Only": projection_only,
+            "Manual Line Note": manual_note, "Consensus Line": r.get("Consensus Line", original_line) if original_line is not None else "No Line", "Projection": round(proj, 2),
+            "Edge": edge_val, "Abs Edge": abs_edge_val, "Pick": side,
             "Fair Prob": round(prob * 100, 1), "EV": round(ev * 100, 1) if ev is not None else None,
             "Kelly": round(kelly * 100, 2), "Data Score": data_score, "Market Confidence": mkt_conf,
             "Overall Rating": overall_rating, "Volatility": volatility, "Steam Signal": steam,
@@ -786,7 +885,8 @@ def build_board(prop_rows, db):
     if not df.empty:
         ranks = {"ELITE WATCH": 0, "PASS": 1, "LEAN": 2, "NO BET": 3}
         df["_rank"] = df["Signal"].map(ranks).fillna(9)
-        df = df.sort_values(["_rank", "Overall Rating", "Data Score", "Abs Edge"], ascending=[True, False, False, False]).drop(columns=["_rank"])
+        df["_abs_sort"] = pd.to_numeric(df["Abs Edge"], errors="coerce").fillna(-1)
+        df = df.sort_values(["_rank", "Overall Rating", "Data Score", "_abs_sort"], ascending=[True, False, False, False]).drop(columns=["_rank", "_abs_sort"])
     return df
 
 def save_official_snapshots(rows, tag="before"):
@@ -902,7 +1002,7 @@ with st.sidebar:
 
     st.divider()
     board_filter = st.radio("Board filter", ["All Lines", "Today", "Tomorrow"], horizontal=True)
-    signal_filter = st.multiselect("Signals", ["ELITE WATCH", "PASS", "LEAN", "NO BET"], default=["ELITE WATCH", "PASS", "LEAN", "NO BET"])
+    signal_filter = st.multiselect("Signals", ["ELITE WATCH", "PASS", "LEAN", "NO BET", "NO LINE"], default=["ELITE WATCH", "PASS", "LEAN", "NO BET", "NO LINE"])
     book_filter = st.text_input("Filter book contains", value="")
     search_name = st.text_input("Optional player filter", value="")
     max_cards = st.slider("Max cards", 25, 500, 200)
@@ -936,8 +1036,20 @@ if should_load and api_key_input:
     with st.spinner("Loading WNBA events and real player props from The Odds API..."):
         api_props, events = fetch_all_real_props(api_key_input, selected_market_keys, regions, bookmakers, days_ahead)
         manual_props = load_manual_props()
+        db_now = projection_db_combined()
+        projection_rows = projection_only_rows_from_db(db_now, events, selected_market_keys)
+
+        # Always show player cards. Real/API/manual line cards appear first when available;
+        # projection-only cards fill the board when no sportsbook prop line is returned.
         raw_props = api_props + manual_props
-        board_df = build_board(raw_props, projection_db_combined())
+        if not raw_props:
+            raw_props = projection_rows
+        else:
+            # Add projection-only cards for players/markets that do not have a line yet.
+            existing_keys = set((normalize_name(x.get("Player")), x.get("Market")) for x in raw_props)
+            raw_props += [x for x in projection_rows if (normalize_name(x.get("Player")), x.get("Market")) not in existing_keys]
+
+        board_df = build_board(raw_props, db_now)
         st.session_state["events"] = events
         st.session_state["raw_props"] = raw_props
         st.session_state["board_df"] = board_df
@@ -950,7 +1062,7 @@ last_loaded = st.session_state.get("last_loaded", "Not loaded")
 if api_key_input and board_df.empty:
     st.markdown(f"""
     <div class="warn-card">
-    <b>No player props showing yet.</b><br>
+    <b>No sportsbook player props returned yet.</b><br>
     Click Refresh / Load Board. If still empty, check the Logs tab. Most common causes: The Odds API key does not include player-prop markets, selected markets are not available yet, or the WNBA games for today/tomorrow have no posted player props.<br>
     Last loaded: {last_loaded}<br>
     Tip: try selecting only Points/Rebounds/Assists first and clear the bookmaker filter. You can also use the Manual Props tab to enter Underdog lines manually.
@@ -986,7 +1098,7 @@ if not board_df.empty:
         render_player_cards(filt, max_cards=max_cards)
 
     with tab_table:
-        cols = ["Player", "Game Day", "Matchup", "Book", "Market Label", "Line", "Book Line", "Manual Line Active", "Consensus Line", "Projection", "Edge", "Pick", "Fair Prob", "EV", "Kelly", "Data Score", "Market Confidence", "Overall Rating", "Volatility", "Steam Signal", "Protection Tag", "Signal", "Book Count", "Alt Line", "Over Price", "Under Price", "CLV Δ", "Line Δ", "Risk Notes", "Projection Notes"]
+        cols = ["Player", "Game Day", "Matchup", "Book", "Market Label", "Line", "Book Line", "Projection Only", "Manual Line Active", "Consensus Line", "Projection", "Edge", "Pick", "Fair Prob", "EV", "Kelly", "Data Score", "Market Confidence", "Overall Rating", "Volatility", "Steam Signal", "Protection Tag", "Signal", "Book Count", "Alt Line", "Over Price", "Under Price", "CLV Δ", "Line Δ", "Risk Notes", "Projection Notes"]
         safe_cols = [c for c in cols if c in filt.columns]
         st.dataframe(filt[safe_cols], use_container_width=True, height=740)
         st.download_button("Download board CSV", filt[safe_cols].to_csv(index=False).encode("utf-8"), "wnba_oddsapi_board.csv", "text/csv")
