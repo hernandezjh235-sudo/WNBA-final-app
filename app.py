@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA ODDSAPI CLEAN v1.3 MANUAL LINE ADJUSTER"
+APP_VERSION = "WNBA ODDSAPI CLEAN v1.4 NO SECRETS WARNING"
 DEFAULT_ODDS_API_KEY = "c9f5eadbe263f64c3fd17df20a4f1f3b"
 
 SPORT_KEY = "basketball_wnba"
@@ -191,11 +191,8 @@ def name_score(a, b):
     return difflib.SequenceMatcher(None, a_norm, b_norm).ratio()
 
 def get_api_key():
-    try:
-        key = st.secrets.get("ODDS_API_KEY", "")
-        if key: return str(key)
-    except Exception:
-        pass
+    # Avoid st.secrets because Streamlit prints "No secrets found" when no secrets.toml exists.
+    # Railway/Streamlit environment variable can still override the default key.
     return os.getenv("ODDS_API_KEY", DEFAULT_ODDS_API_KEY)
 
 def safe_get_json(url, params=None, timeout=20):
@@ -861,6 +858,7 @@ with st.sidebar:
     save_tag = st.selectbox("Snapshot type", ["before", "after"], index=0)
     only_save = st.multiselect("Save only signals", ["ELITE WATCH", "PASS", "LEAN", "NO BET"], default=["ELITE WATCH", "PASS", "LEAN"])
     refresh = st.button("🔄 Refresh / Load Board", use_container_width=True)
+    st.caption("If no players show, open the Logs tab to see API status/errors.")
 
 if refresh:
     st.cache_data.clear()
@@ -898,8 +896,9 @@ if api_key_input and board_df.empty:
     st.markdown(f"""
     <div class="warn-card">
     <b>No player props showing yet.</b><br>
-    Click Refresh / Load Board. If still empty, The Odds API may not have those WNBA player-prop markets open right now, your key may not include player props, or selected markets/books are too narrow.<br>
-    Last loaded: {last_loaded}
+    Click Refresh / Load Board. If still empty, check the Logs tab. Most common causes: The Odds API key does not include player-prop markets, selected markets are not available yet, or the WNBA games for today/tomorrow have no posted player props.<br>
+    Last loaded: {last_loaded}<br>
+    Tip: try selecting only Points/Rebounds/Assists first and clear the bookmaker filter.
     </div>
     """, unsafe_allow_html=True)
 
@@ -1074,3 +1073,4 @@ else:
             st.dataframe(pd.DataFrame(req_rows).tail(200), use_container_width=True, height=500)
         else:
             st.caption("No request logs yet.")
+
