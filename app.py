@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA ODDSAPI CLEAN v1.4 NO SECRETS WARNING"
+APP_VERSION = "WNBA ODDSAPI CLEAN v1.5 MANUAL PROP BOARD"
 DEFAULT_ODDS_API_KEY = "c9f5eadbe263f64c3fd17df20a4f1f3b"
 
 SPORT_KEY = "basketball_wnba"
@@ -93,6 +93,7 @@ REQUEST_LOG_FILE = os.path.join(STORAGE_DIR, "request_log.json")
 BEFORE_AFTER_FILE = os.path.join(STORAGE_DIR, "before_after_snapshots.json")
 CUSTOM_STATS_FILE = os.path.join(STORAGE_DIR, "custom_projection_stats.json")
 MANUAL_LINES_FILE = os.path.join(STORAGE_DIR, "manual_line_overrides.json")
+MANUAL_PROPS_FILE = os.path.join(STORAGE_DIR, "manual_prop_board.json")
 
 st.set_page_config(page_title="WNBA Prop Engine", layout="wide", initial_sidebar_state="expanded")
 
@@ -357,6 +358,58 @@ def consensus_lines(rows):
             rr["Alt Line"] = consensus is not None and abs(float(rr["Line"]) - consensus) >= 1.0
             out.append(rr)
     return out
+
+
+def load_manual_props():
+    data = load_json(MANUAL_PROPS_FILE, [])
+    return data if isinstance(data, list) else []
+
+def save_manual_props(rows):
+    save_json(MANUAL_PROPS_FILE, rows)
+
+def add_manual_prop(player, market, line, book="Manual/Underdog", matchup="Manual Entry", game_day="Manual", over_price=-110, under_price=-110, note=""):
+    rows = load_manual_props()
+    rec = {
+        "id": f"{now_iso()}::{normalize_name(player)}::{market}::{line}",
+        "Event ID": "manual",
+        "Game Day": game_day or "Manual",
+        "Commence Time": "",
+        "Matchup": matchup or "Manual Entry",
+        "Home Team": "",
+        "Away Team": "",
+        "Book": book or "Manual/Underdog",
+        "Book Key": "manual",
+        "Market": market,
+        "Market Label": MARKET_MAP.get(market, market),
+        "Player": player.strip(),
+        "Line": float(line),
+        "Price": -110,
+        "Over Price": safe_float(over_price, -110) or -110,
+        "Under Price": safe_float(under_price, -110) or -110,
+        "Source": "Manual Line",
+        "Real Line": True,
+        "Book Count": 1,
+        "Consensus Line": float(line),
+        "Books": book or "Manual/Underdog",
+        "Alt Line": False,
+        "Manual Prop": True,
+        "Manual Note": note,
+        "Created At": now_iso(),
+    }
+    rows.append(rec)
+    save_manual_props(rows[-500:])
+    return rec
+
+def clear_manual_props():
+    save_manual_props([])
+    return True
+
+def delete_manual_prop(row_id):
+    rows = load_manual_props()
+    new_rows = [r for r in rows if r.get("id") != row_id]
+    save_manual_props(new_rows)
+    return len(rows) - len(new_rows)
+
 
 def fetch_all_real_props(api_key, selected_markets, regions, bookmakers, days_ahead):
     events = fetch_wnba_events(api_key, days_ahead=days_ahead)
@@ -881,7 +934,9 @@ if not api_key_input:
 
 if should_load and api_key_input:
     with st.spinner("Loading WNBA events and real player props from The Odds API..."):
-        raw_props, events = fetch_all_real_props(api_key_input, selected_market_keys, regions, bookmakers, days_ahead)
+        api_props, events = fetch_all_real_props(api_key_input, selected_market_keys, regions, bookmakers, days_ahead)
+        manual_props = load_manual_props()
+        raw_props = api_props + manual_props
         board_df = build_board(raw_props, projection_db_combined())
         st.session_state["events"] = events
         st.session_state["raw_props"] = raw_props
@@ -898,7 +953,7 @@ if api_key_input and board_df.empty:
     <b>No player props showing yet.</b><br>
     Click Refresh / Load Board. If still empty, check the Logs tab. Most common causes: The Odds API key does not include player-prop markets, selected markets are not available yet, or the WNBA games for today/tomorrow have no posted player props.<br>
     Last loaded: {last_loaded}<br>
-    Tip: try selecting only Points/Rebounds/Assists first and clear the bookmaker filter.
+    Tip: try selecting only Points/Rebounds/Assists first and clear the bookmaker filter. You can also use the Manual Props tab to enter Underdog lines manually.
     </div>
     """, unsafe_allow_html=True)
 
@@ -925,7 +980,7 @@ if not board_df.empty:
         n = save_official_snapshots(save_rows, tag=save_tag)
         st.success(f"Saved {n} official {save_tag} snapshots.")
 
-    tab_cards, tab_table, tab_games, tab_saved, tab_grade, tab_learning, tab_manual, tab_stats, tab_logs = st.tabs(["🃏 Player Cards", "📋 Prop Table", "📅 Games", "💾 Saved/CLV", "✅ Grade", "🧠 Learning", "✏️ Manual Line", "📥 Projection DB", "🧾 Logs"])
+    tab_cards, tab_table, tab_games, tab_saved, tab_grade, tab_learning, tab_manual_props, tab_manual, tab_stats, tab_logs = st.tabs(["🃏 Player Cards", "📋 Prop Table", "📅 Games", "💾 Saved/CLV", "✅ Grade", "🧠 Learning", "➕ Manual Props", "✏️ Manual Line", "📥 Projection DB", "🧾 Logs"])
 
     with tab_cards:
         render_player_cards(filt, max_cards=max_cards)
@@ -938,6 +993,43 @@ if not board_df.empty:
 
     with tab_games:
         render_game_cards(events)
+
+    with tab_manual_props_empty:
+        st.subheader("Manual Prop Board")
+        st.caption("Games are loading but player props are not. Enter real lines manually from Underdog or another book.")
+
+        inv_market_manual = {v: k for k, v in MARKET_MAP.items()}
+        current_manual = load_manual_props()
+        if current_manual:
+            st.dataframe(pd.DataFrame(current_manual), use_container_width=True, height=260)
+        else:
+            st.info("No manual props added yet.")
+
+        with st.form("manual_prop_add_form_empty"):
+            mp_player = st.text_input("Player", value="", placeholder="Jackie Young")
+            mp_market_label = st.selectbox("Market", list(MARKET_MAP.values()), key="manual_prop_market_empty")
+            mp_line = st.number_input("Line", min_value=0.0, max_value=150.0, step=0.5, value=15.5, key="manual_prop_line_empty")
+            mp_book = st.text_input("Book / Source", value="Underdog", key="manual_prop_book_empty")
+            mp_matchup = st.text_input("Matchup optional", value="Manual Entry", key="manual_prop_match_empty")
+            mp_day = st.selectbox("Game day label", ["Manual", "Today", "Tomorrow"], index=0, key="manual_prop_day_empty")
+            c_ov, c_un = st.columns(2)
+            mp_over_price = c_ov.number_input("Over price", value=-110, step=1, key="manual_over_empty")
+            mp_under_price = c_un.number_input("Under price", value=-110, step=1, key="manual_under_empty")
+            mp_note = st.text_input("Note optional", value="", key="manual_prop_note_empty")
+            submitted_manual_prop = st.form_submit_button("Add manual prop to board")
+
+            if submitted_manual_prop:
+                if not mp_player.strip():
+                    st.warning("Enter a player name.")
+                else:
+                    add_manual_prop(mp_player.strip(), inv_market_manual[mp_market_label], mp_line, mp_book.strip(), mp_matchup.strip(), mp_day, mp_over_price, mp_under_price, mp_note.strip())
+                    st.success("Manual prop added. Hit Refresh / Load Board to show it on player cards.")
+
+        if st.button("Clear ALL manual props", use_container_width=True, key="clear_manual_props_empty"):
+            clear_manual_props()
+            st.success("Manual props cleared. Refresh board.")
+
+
 
     with tab_saved:
         saved = pd.DataFrame(load_json(PICK_LOG, []))
@@ -976,6 +1068,63 @@ if not board_df.empty:
                 player, market = k.split("::", 1) if "::" in k else (k, "")
                 rows.append({"Player": player, "Market": market, "Scale": v.get("scale"), "Samples": v.get("samples"), "Avg Residual": v.get("avg_residual"), "Updated": v.get("updated_at")})
             st.dataframe(pd.DataFrame(rows), use_container_width=True, height=520)
+
+
+    with tab_manual_props:
+        st.subheader("Manual Prop Board")
+        st.caption("Use this when The Odds API shows games but no player props. Enter real lines manually from Underdog or another book. Projection stays unchanged.")
+
+        inv_market_manual = {v: k for k, v in MARKET_MAP.items()}
+
+        current_manual = load_manual_props()
+        if current_manual:
+            st.write("Manual props currently active")
+            st.dataframe(pd.DataFrame(current_manual), use_container_width=True, height=260)
+        else:
+            st.info("No manual props added yet.")
+
+        with st.form("manual_prop_add_form"):
+            mp_player = st.text_input("Player", value="", placeholder="Jackie Young")
+            mp_market_label = st.selectbox("Market", list(MARKET_MAP.values()), key="manual_prop_market")
+            mp_line = st.number_input("Line", min_value=0.0, max_value=150.0, step=0.5, value=15.5)
+            mp_book = st.text_input("Book / Source", value="Underdog")
+            mp_matchup = st.text_input("Matchup optional", value="Manual Entry")
+            mp_day = st.selectbox("Game day label", ["Manual", "Today", "Tomorrow"], index=0)
+            c_ov, c_un = st.columns(2)
+            mp_over_price = c_ov.number_input("Over price", value=-110, step=1)
+            mp_under_price = c_un.number_input("Under price", value=-110, step=1)
+            mp_note = st.text_input("Note optional", value="")
+            submitted_manual_prop = st.form_submit_button("Add manual prop to board")
+
+            if submitted_manual_prop:
+                if not mp_player.strip():
+                    st.warning("Enter a player name.")
+                else:
+                    add_manual_prop(
+                        mp_player.strip(),
+                        inv_market_manual[mp_market_label],
+                        mp_line,
+                        mp_book.strip(),
+                        mp_matchup.strip(),
+                        mp_day,
+                        mp_over_price,
+                        mp_under_price,
+                        mp_note.strip(),
+                    )
+                    st.success("Manual prop added. Hit Refresh / Load Board to show it on player cards.")
+
+        c_clear, c_refresh_note = st.columns(2)
+        if c_clear.button("Clear ALL manual props", use_container_width=True):
+            clear_manual_props()
+            st.success("Manual props cleared. Refresh board.")
+        c_refresh_note.info("After adding or clearing, hit Refresh / Load Board.")
+
+        st.markdown("""
+        <div class="warn-card">
+        <b>Important:</b> Manual props are still real lines only if you enter them from a real source. They do not change the projection DB or learning baseline.
+        </div>
+        """, unsafe_allow_html=True)
+
 
     with tab_manual:
         st.subheader("Manual Line Adjuster")
@@ -1064,13 +1213,49 @@ if not board_df.empty:
         else:
             st.caption("No request logs yet.")
 else:
-    tab_games, tab_logs = st.tabs(["📅 Games", "🧾 Logs"])
+    tab_games, tab_manual_props_empty, tab_logs = st.tabs(["📅 Games", "➕ Manual Props", "🧾 Logs"])
     with tab_games:
         render_game_cards(events)
+
+    with tab_manual_props_empty:
+        st.subheader("Manual Prop Board")
+        st.caption("Games are loading but player props are not. Enter real lines manually from Underdog or another book.")
+
+        inv_market_manual = {v: k for k, v in MARKET_MAP.items()}
+        current_manual = load_manual_props()
+        if current_manual:
+            st.dataframe(pd.DataFrame(current_manual), use_container_width=True, height=260)
+        else:
+            st.info("No manual props added yet.")
+
+        with st.form("manual_prop_add_form_empty"):
+            mp_player = st.text_input("Player", value="", placeholder="Jackie Young")
+            mp_market_label = st.selectbox("Market", list(MARKET_MAP.values()), key="manual_prop_market_empty")
+            mp_line = st.number_input("Line", min_value=0.0, max_value=150.0, step=0.5, value=15.5, key="manual_prop_line_empty")
+            mp_book = st.text_input("Book / Source", value="Underdog", key="manual_prop_book_empty")
+            mp_matchup = st.text_input("Matchup optional", value="Manual Entry", key="manual_prop_match_empty")
+            mp_day = st.selectbox("Game day label", ["Manual", "Today", "Tomorrow"], index=0, key="manual_prop_day_empty")
+            c_ov, c_un = st.columns(2)
+            mp_over_price = c_ov.number_input("Over price", value=-110, step=1, key="manual_over_empty")
+            mp_under_price = c_un.number_input("Under price", value=-110, step=1, key="manual_under_empty")
+            mp_note = st.text_input("Note optional", value="", key="manual_prop_note_empty")
+            submitted_manual_prop = st.form_submit_button("Add manual prop to board")
+
+            if submitted_manual_prop:
+                if not mp_player.strip():
+                    st.warning("Enter a player name.")
+                else:
+                    add_manual_prop(mp_player.strip(), inv_market_manual[mp_market_label], mp_line, mp_book.strip(), mp_matchup.strip(), mp_day, mp_over_price, mp_under_price, mp_note.strip())
+                    st.success("Manual prop added. Hit Refresh / Load Board to show it on player cards.")
+
+        if st.button("Clear ALL manual props", use_container_width=True, key="clear_manual_props_empty"):
+            clear_manual_props()
+            st.success("Manual props cleared. Refresh board.")
+
+
     with tab_logs:
         req_rows = load_json(REQUEST_LOG_FILE, [])
         if isinstance(req_rows, list) and req_rows:
             st.dataframe(pd.DataFrame(req_rows).tail(200), use_container_width=True, height=500)
         else:
             st.caption("No request logs yet.")
-
