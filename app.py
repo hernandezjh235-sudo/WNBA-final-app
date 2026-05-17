@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "WNBA ODDSAPI CLEAN v1.9 EMPTY TAB FIX"
+APP_VERSION = "WNBA ODDSAPI CLEAN v2.0 UNDERDOG LINE PICK FIX"
 DEFAULT_ODDS_API_KEY = "c9f5eadbe263f64c3fd17df20a4f1f3b"
 
 SPORT_KEY = "basketball_wnba"
@@ -793,10 +793,13 @@ def build_board(prop_rows, db):
         player = r["Player"]
         if is_bad_player_name(player): continue
         original_line = safe_float(r.get("Line"))
-        projection_only = bool(r.get("Projection Only")) or original_line is None
 
         manual_line, manual_note, manual_scope = get_manual_line_override(player, r["Market"], r.get("Book", ""))
         line = manual_line if manual_line is not None else original_line
+
+        # If a manual/Underdog line is entered, this becomes an actionable pick card.
+        # Projection remains unchanged. Only edge/pick/EV/rating use the manual line.
+        projection_only = (bool(r.get("Projection Only")) or original_line is None) and manual_line is None
 
         # Projection is calculated from the projection DB and is not changed by manual lines.
         if projection_only:
@@ -973,6 +976,8 @@ def render_player_cards(df, max_cards=200):
         line_display = row.get("Line", "No Line")
         book_line_display = row.get("Book Line", line_display)
         consensus_display = row.get("Consensus Line", line_display)
+        if row.get("Manual Line Active", False):
+            book_line_display = f"Underdog {line_display}"
         projection_display = fmt_num(row.get("Projection"), 2)
         edge_display = fmt_num(row.get("Edge"), 2, signed=True)
         fair_prob_display = fmt_pct(row.get("Fair Prob"))
@@ -1012,6 +1017,84 @@ def render_player_cards(df, max_cards=200):
             <div class="small-muted"><b>Model:</b> {row.get('Projection Notes','')}</div>
         </div>
         """, unsafe_allow_html=True)
+
+
+def render_quick_underdog_line_board():
+    st.subheader("Quick Underdog Line Board")
+    st.caption("Enter Underdog lines for many players at once. This does not change projections. It only makes Edge/Pick/EV/Rating work.")
+
+    db_for_lines = projection_db_combined()
+    quick_markets = ["player_points", "player_rebounds", "player_assists", "player_threes", "player_points_rebounds_assists"]
+    quick_rows = []
+
+    for p_name, p_stats in db_for_lines.items():
+        if is_bad_player_name(p_name):
+            continue
+        for mk in quick_markets:
+            proj_val = market_stat_value(p_stats, mk)
+            if proj_val is None:
+                continue
+            existing_line, existing_note, existing_scope = get_manual_line_override(p_name, mk, "")
+            quick_rows.append({
+                "Player": p_name,
+                "Market": MARKET_MAP.get(mk, mk),
+                "Projection": round(float(proj_val), 2),
+                "Underdog Line": existing_line,
+                "Note": existing_note or "",
+            })
+
+    quick_df = pd.DataFrame(quick_rows)
+    edited_quick = st.data_editor(
+        quick_df,
+        use_container_width=True,
+        height=520,
+        num_rows="fixed",
+        column_config={
+            "Player": st.column_config.TextColumn("Player", disabled=True),
+            "Market": st.column_config.TextColumn("Market", disabled=True),
+            "Projection": st.column_config.NumberColumn("Projection", disabled=True, format="%.2f"),
+            "Underdog Line": st.column_config.NumberColumn("Underdog Line", min_value=0.0, max_value=150.0, step=0.5, format="%.1f"),
+            "Note": st.column_config.TextColumn("Note"),
+        },
+        key="quick_underdog_line_editor",
+    )
+
+    c_save_quick, c_clear_quick = st.columns(2)
+    if c_save_quick.button("Save Quick Underdog Lines", use_container_width=True):
+        saved_count = 0
+        inv_market_quick = {v: k for k, v in MARKET_MAP.items()}
+        for _, er in edited_quick.iterrows():
+            player_val = str(er.get("Player", "")).strip()
+            market_label_val = str(er.get("Market", "")).strip()
+            market_key_val = inv_market_quick.get(market_label_val)
+            line_val = safe_float(er.get("Underdog Line"))
+            note_val = str(er.get("Note", "") or "").strip()
+
+            if player_val and market_key_val and line_val is not None:
+                set_manual_line_override(
+                    player_val,
+                    market_key_val,
+                    line_val,
+                    "",
+                    note_val or "Underdog quick board"
+                )
+                saved_count += 1
+
+        st.success(f"Saved {saved_count} Underdog line override(s). Hit Refresh / Load Board to update picks.")
+
+    if c_clear_quick.button("Clear All Quick Underdog Lines", use_container_width=True):
+        data = load_manual_lines()
+        new_data = {k: v for k, v in data.items() if str(v.get("book", "")).strip() != ""}
+        save_manual_lines(new_data)
+        st.success("Cleared global Underdog line overrides. Hit Refresh / Load Board.")
+
+    st.markdown("""
+    <div class="warn-card">
+    <b>Important:</b> Underdog lines only affect Edge, Pick, EV, Rating, and Protection.
+    They do not change projections or the learning baseline.
+    </div>
+    """, unsafe_allow_html=True)
+
 
 st.markdown(f"""
 <div class="hero-panel">
@@ -1130,13 +1213,13 @@ if not board_df.empty:
         n = save_official_snapshots(save_rows, tag=save_tag)
         st.success(f"Saved {n} official {save_tag} snapshots.")
 
-    tab_cards, tab_table, tab_games, tab_saved, tab_grade, tab_learning, tab_manual_props, tab_manual, tab_stats, tab_logs = st.tabs(["🃏 Player Cards", "📋 Prop Table", "📅 Games", "💾 Saved/CLV", "✅ Grade", "🧠 Learning", "➕ Manual Props", "✏️ Manual Line", "📥 Projection DB", "🧾 Logs"])
+    tab_cards, tab_table, tab_games, tab_saved, tab_grade, tab_learning, tab_ud_lines, tab_manual_props, tab_manual, tab_stats, tab_logs = st.tabs(["🃏 Player Cards", "📋 Prop Table", "📅 Games", "💾 Saved/CLV", "✅ Grade", "🧠 Learning", "📌 Underdog Lines", "➕ Manual Props", "✏️ Manual Line", "📥 Projection DB", "🧾 Logs"])
 
     with tab_cards:
         render_player_cards(filt, max_cards=max_cards)
 
     with tab_table:
-        cols = ["Player", "Game Day", "Matchup", "Book", "Market Label", "Line", "Book Line", "Projection Only", "Manual Line Active", "Consensus Line", "Projection", "Edge", "Pick", "Fair Prob", "EV", "Kelly", "Data Score", "Market Confidence", "Overall Rating", "Volatility", "Steam Signal", "Protection Tag", "Signal", "Book Count", "Alt Line", "Over Price", "Under Price", "CLV Δ", "Line Δ", "Risk Notes", "Projection Notes"]
+        cols = ["Player", "Game Day", "Matchup", "Book", "Market Label", "Line", "Book Line", "Projection Only", "Manual Line Active", "Manual Line Note", "Consensus Line", "Projection", "Edge", "Pick", "Fair Prob", "EV", "Kelly", "Data Score", "Market Confidence", "Overall Rating", "Volatility", "Steam Signal", "Protection Tag", "Signal", "Book Count", "Alt Line", "Over Price", "Under Price", "CLV Δ", "Line Δ", "Risk Notes", "Projection Notes"]
         safe_cols = [c for c in cols if c in filt.columns]
         st.dataframe(filt[safe_cols], use_container_width=True, height=740)
         st.download_button("Download board CSV", filt[safe_cols].to_csv(index=False).encode("utf-8"), "wnba_oddsapi_board.csv", "text/csv")
@@ -1144,6 +1227,8 @@ if not board_df.empty:
     with tab_games:
         render_game_cards(events)
 
+    with tab_ud_lines:
+        render_quick_underdog_line_board()
 
     with tab_logs:
         req_rows = load_json(REQUEST_LOG_FILE, [])
@@ -1152,10 +1237,12 @@ if not board_df.empty:
         else:
             st.caption("No request logs yet.")
 else:
-    tab_games, tab_logs = st.tabs(["📅 Games", "🧾 Logs"])
+    tab_games, tab_ud_lines_empty, tab_logs = st.tabs(["📅 Games", "📌 Underdog Lines", "🧾 Logs"])
     with tab_games:
         render_game_cards(events)
 
+    with tab_ud_lines:
+        render_quick_underdog_line_board()
 
     with tab_logs:
         req_rows = load_json(REQUEST_LOG_FILE, [])
