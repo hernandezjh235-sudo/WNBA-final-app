@@ -113,10 +113,17 @@ section[data-testid="stSidebar"] {background:#050912; border-right:1px solid rgb
 """, unsafe_allow_html=True)
 
 def get_secret(key: str, default: str = "") -> str:
+    """Read secrets safely on Railway, Streamlit Cloud, or local.
+    Priority:
+    1. Streamlit secrets.toml if available
+    2. Railway/environment variable
+    3. default
+    """
     try:
-        value = st.secrets.get(key, default)
-        if value:
-            return str(value)
+        if hasattr(st, "secrets") and key in st.secrets:
+            value = st.secrets.get(key, default)
+            if value:
+                return str(value)
     except Exception:
         pass
     return os.getenv(key, default)
