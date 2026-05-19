@@ -30,7 +30,7 @@ try:
 except Exception:
     ZoneInfo = None
 
-APP_VERSION = "NBA MERGED EXACT LINES + 10/10 LIVE TRACKING + v11.17 EDGE LOGIC — UD PARSER FIX"
+APP_VERSION = "NBA MERGED EXACT LINES + 10/10 LIVE TRACKING + v11.17 EDGE LOGIC — RAILWAY SAFE"
 APP_TITLE = "DEVIL PICKS — NBA Merged Prop Engine"
 SPORT_KEY = "basketball_nba"
 CURRENT_SEASON = "2025-26"
@@ -242,7 +242,7 @@ def prop_from_market_text(text: Any) -> Optional[str]:
     return None
 
 @st.cache_data(ttl=180, show_spinner=False)
-def safe_get_json(url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, timeout: int = 12) -> Any:
+def safe_get_json(url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, timeout: int = 7) -> Any:
     h = {
         "User-Agent": "Mozilla/5.0 DevilPicksNBA/1.0",
         "Accept": "application/json,text/plain,*/*",
@@ -461,7 +461,7 @@ def parse_prizepicks_props(data: Any, selected_props: List[str]) -> List[Dict[st
 def get_all_live_props(selected_props: List[str]) -> List[Dict[str, Any]]:
     rows = []
     for url in UNDERDOG_URLS:
-        data = safe_get_json(url, timeout=18)
+        data = safe_get_json(url, timeout=7)
         payload_dicts = len(flatten_json(data)) if data is not None else 0
         parsed = parse_underdog_props(data, [], selected_props)
         nba_hint = False
@@ -474,7 +474,7 @@ def get_all_live_props(selected_props: List[str]) -> List[Dict[str, Any]]:
         log_request(url, status, f"payload_dicts={payload_dicts}; parsed_rows={len(parsed)}; selected={selected_props}")
         rows.extend(parsed)
 
-    pp = safe_get_json(PRIZEPICKS_URL, timeout=18)
+    pp = safe_get_json(PRIZEPICKS_URL, timeout=7)
     pp_rows = parse_prizepicks_props(pp, selected_props)
     log_request(PRIZEPICKS_URL, "OK" if pp_rows else "OK_NO_ROWS", f"rows={len(pp_rows)}")
     rows.extend(pp_rows)
@@ -641,7 +641,7 @@ def render_prop_cards(rows: List[Dict[str, Any]], limit: int = 12):
           <span class='badge'>Proj {'N/A' if projection is None else f'{projection:.2f}'}</span>
           <span class='badge'>Edge {'N/A' if edge is None else f'{edge:+.2f}'}</span>
           <span class='badge'>Prob {'N/A' if prob is None else f'{prob*100:.1f}%'}</span>
-          <span class='badge'>EV {'N/A' if p.get('EV') is None else f'{p.get('EV')*100:.1f}%'}</span>
+          <span class='badge'>EV {"N/A" if p.get("EV") is None else f"{p.get('EV')*100:.1f}%"}</span>
           <span class='badge'>Odds {odds_display(p.get('Odds Used'))}</span>
           <div class='sub' style='margin-top:8px;'>Reason: {p.get('Reason')}</div>
         </div>
@@ -685,24 +685,37 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 c1, c2, c3, c4 = st.columns(4)
-refresh = c1.button("🔄 Refresh NBA Board", use_container_width=True)
+refresh = c1.button("🔄 Load / Refresh NBA Board", use_container_width=True)
 save_props = c2.button("💾 Save Before Snapshot", use_container_width=True)
 save_closing = c3.button("🔒 Save Closing Snapshot", use_container_width=True)
 save_edges = c4.button("📈 Save Edge History", use_container_width=True)
 
 if refresh:
     st.cache_data.clear()
-    st.success("Cache cleared. Board refreshed.")
+    st.session_state["nba_board_loaded"] = True
+    st.success("Loading live NBA board...")
 
-dates = [date_for_mode("Today"), date_for_mode("Tomorrow")] if day_mode == "Both" else [date_for_mode(day_mode)]
+# Railway-safe: do not call external APIs during initial health/page load.
+# The app renders immediately first, then fetches data only after button click.
+if "nba_board_loaded" not in st.session_state:
+    st.session_state["nba_board_loaded"] = False
+
 games = []
-for d in dates:
-    games.extend(extract_games(d))
-
+raw_props = []
+prop_signals = []
+qualified = []
 manual_adjustments = parse_manual_adjustments(manual_injury_text)
-raw_props = get_all_live_props(selected_props)
-prop_signals = make_prop_signals(raw_props, int(default_odds), float(min_edge), float(min_prob), manual_adjustments)
-qualified = [p for p in prop_signals if p.get("Signal") in ["STRONG", "LEAN"]]
+
+if st.session_state.get("nba_board_loaded"):
+    dates = [date_for_mode("Today"), date_for_mode("Tomorrow")] if day_mode == "Both" else [date_for_mode(day_mode)]
+    for d in dates:
+        games.extend(extract_games(d))
+
+    raw_props = get_all_live_props(selected_props)
+    prop_signals = make_prop_signals(raw_props, int(default_odds), float(min_edge), float(min_prob), manual_adjustments)
+    qualified = [p for p in prop_signals if p.get("Signal") in ["STRONG", "LEAN"]]
+else:
+    st.info("Railway-safe mode: click **Load / Refresh NBA Board** to fetch games and prop lines.")
 
 if save_props:
     n = save_snapshot(PROP_SNAPSHOT_FILE, prop_signals)
