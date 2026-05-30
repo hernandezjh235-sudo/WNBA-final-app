@@ -754,11 +754,18 @@ def fetch_underdog_lines() -> pd.DataFrame:
         return not any(x in b for x in bad)
 
     def extract_line(d: Dict[str, Any]) -> Optional[float]:
-        for k in ["line", "stat_value", "over_under_line", "value", "line_score", "target", "over_under_value"]:
+        for k in ["line", "stat_value", "over_under_line", "value", "line_score", "target", "over_under_value", "statValue"]:
             if k in d:
                 v = safe_float(d.get(k))
                 if v is not None and 0 <= v <= 60:
                     return v
+        # Underdog sometimes nests options/over_under_lines; search one level deeper safely.
+        for child in d.values():
+            if isinstance(child, dict):
+                for k in ["line", "stat_value", "value", "line_score", "target"]:
+                    v = safe_float(child.get(k))
+                    if v is not None and 0 <= v <= 60:
+                        return v
         return None
 
     def clean_ud_player_name(name: Any, market: Optional[str]) -> str:
@@ -775,6 +782,8 @@ def fetch_underdog_lines() -> pd.DataFrame:
         if not data:
             continue
         flat = flatten_json(data)
+        global_feed_blob = blob_text(data, 50000)
+        feed_has_wnba = ("wnba" in global_feed_blob or "women" in global_feed_blob)
 
         player_map: Dict[str, str] = {}
         for d in flat:
@@ -803,7 +812,7 @@ def fetch_underdog_lines() -> pd.DataFrame:
             stat_text = " ".join(text_parts)
             market = strict_market_from_ud_text(stat_text)
             line = extract_line(d)
-            wnba_ok = is_strict_wnba(d)
+            wnba_ok = is_strict_wnba(d) or feed_has_wnba
 
             raw_name = d.get("player_name") or d.get("display_name") or d.get("player") or d.get("athlete") or d.get("title") or d.get("name")
             for key in ["player_id", "appearance_id", "over_under_id", "appearance_stat_id"]:
@@ -879,7 +888,7 @@ def best_line_for_player(player: str, market: str, lines: pd.DataFrame, preferre
         return None
     candidates["score"] = candidates["Player"].apply(lambda x: name_score(player, x))
     # Underdog must be stricter because public feeds can contain abbreviations and stale titles.
-    candidates["min_score"] = candidates["Source"].astype(str).str.lower().map(lambda s: 0.90 if s == "underdog" else 0.86)
+    candidates["min_score"] = candidates["Source"].astype(str).str.lower().map(lambda s: 0.84 if s == "underdog" else 0.84)
     candidates = candidates[candidates["score"] >= candidates["min_score"]].sort_values(["score", "Source"], ascending=[False, True])
     if candidates.empty:
         return None
@@ -1184,30 +1193,77 @@ def matchup_factor(opp_abbr: str, market: str, pos_bucket: str, team_stats: Dict
     return clamp(fac, 0.91, 1.10), f"Fallback PA proxy {pa:.1f}; {pos_bucket} role"
 
 
+def market_projection_cap(market: str, exp_minutes: float) -> float:
+    """Hard sanity cap so bad feed parsing can never create impossible WNBA props."""
+    base_caps = {"Points": 42.0, "Rebounds": 18.0, "Assists": 14.0}
+    cap = base_caps.get(market, 30.0)
+    # Bench/low-minute players should not project like stars even if one bad log row slips in.
+    if exp_minutes < 18:
+        cap *= 0.55
+    elif exp_minutes < 24:
+        cap *= 0.72
+    elif exp_minutes < 30:
+        cap *= 0.88
+    return float(cap)
+
+
+def clean_stat_series_for_market(logs: pd.DataFrame, market: str) -> Tuple[pd.Series, pd.Series]:
+    """Return cleaned stat/minute series with WNBA-realistic row-level bounds.
+
+    This fixes the issue where ESPN label/order changes can make rebounds/assists parse
+    into the wrong column and create projections like 40-60 rebounds.
+    """
+    stat = STAT_KEYS[market]
+    vals = pd.to_numeric(logs.get(stat, pd.Series(dtype=float)), errors="coerce")
+    mins = pd.to_numeric(logs.get("MIN", pd.Series(dtype=float)), errors="coerce")
+    limits = {
+        "Points": (0, 55, 1.45),
+        "Rebounds": (0, 26, 0.72),
+        "Assists": (0, 18, 0.55),
+    }
+    lo, hi, ppm_hi = limits.get(market, (0, 60, 2.0))
+    vals = vals.where((vals >= lo) & (vals <= hi))
+    mins = mins.where((mins >= 1) & (mins <= 45))
+    per_min = vals / mins.replace(0, np.nan)
+    vals = vals.where((per_min.isna()) | (per_min <= ppm_hi))
+    return vals, mins
+
+
 def projection_for_market(logs: pd.DataFrame, market: str, exp_minutes: float, pace_fac: float, match_fac: float, learn_scale: float) -> Dict[str, Any]:
     stat = STAT_KEYS[market]
+    per_min_cap = {"Points": 1.05, "Rebounds": 0.42, "Assists": 0.34}[market]
+    fallback_pm = {"Points": 0.36, "Rebounds": 0.16, "Assists": 0.10}[market]
+
     if logs.empty or stat not in logs:
-        per_min = {"Points": 0.36, "Rebounds": 0.16, "Assists": 0.10}[market]
+        per_min = fallback_pm
         base = exp_minutes * per_min
         source = "Fallback per-minute"
     else:
-        vals = pd.to_numeric(logs[stat], errors="coerce")
-        mins = pd.to_numeric(logs["MIN"], errors="coerce").replace(0, np.nan)
-        per_min_series = (vals / mins).replace([np.inf, -np.inf], np.nan).dropna()
+        vals, mins = clean_stat_series_for_market(logs, market)
+        per_min_series = (vals / mins.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
+        per_min_series = per_min_series[per_min_series <= per_min_cap]
         recent_pm = weighted_recent(per_min_series, None)
-        stat_recent = weighted_recent(vals, None)
+        stat_recent = weighted_recent(vals.dropna(), None)
         if recent_pm is None and stat_recent is None:
-            per_min = {"Points": 0.36, "Rebounds": 0.16, "Assists": 0.10}[market]
+            per_min = fallback_pm
             base = exp_minutes * per_min
-            source = "Fallback per-minute"
+            source = "Fallback per-minute after stat sanitation"
         else:
-            by_rate = exp_minutes * (recent_pm or ((stat_recent or 0) / max(exp_minutes, 1)))
+            safe_pm = clamp(recent_pm if recent_pm is not None else ((stat_recent or 0) / max(exp_minutes, 1)), 0, per_min_cap)
+            by_rate = exp_minutes * safe_pm
+            # stat_recent can be useful, but cap it to the player's projected-minute context.
+            if stat_recent is not None:
+                stat_recent = min(stat_recent, exp_minutes * per_min_cap * 1.10)
             by_stat = stat_recent if stat_recent is not None else by_rate
-            base = 0.70 * by_rate + 0.30 * by_stat
-            source = "Weighted per-minute + recent stat"
-    proj = float(max(0, base * pace_fac * match_fac * learn_scale))
-    return {"projection": proj, "source": source}
+            base = 0.78 * by_rate + 0.22 * by_stat
+            source = "Sanitized weighted per-minute + recent stat"
 
+    raw_proj = float(max(0, base * pace_fac * match_fac * learn_scale))
+    cap = market_projection_cap(market, exp_minutes)
+    proj = float(clamp(raw_proj, 0, cap))
+    if raw_proj > cap:
+        source += f" | sanity capped {raw_proj:.2f}->{cap:.2f}"
+    return {"projection": proj, "source": source}
 
 def volatility_for_market(logs: pd.DataFrame, market: str, exp_minutes: float, min_risk: str) -> float:
     stat = STAT_KEYS[market]
