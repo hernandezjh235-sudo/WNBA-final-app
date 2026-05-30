@@ -45,7 +45,7 @@ try:
 except Exception:
     pytz = None
 
-APP_VERSION = "WNBA_ELITE_PROP_MONEYLINE_ENGINE_v1.1_UD2_INJURY_DVP_MINUTES_GATE"
+APP_VERSION = "WNBA_ELITE_PROP_MONEYLINE_ENGINE_v1.2_FIXED_BOXSCORE_ALIAS"
 
 # ============================================================
 # STORAGE
@@ -617,19 +617,25 @@ def boxscore_player_rows(event_id: str) -> pd.DataFrame:
 
 
 
-# Backward-compatible alias used by Defense vs Position 2.0.
-# v1.1 originally called fetch_event_boxscore(), but the actual ESPN
-# boxscore parser is boxscore_player_rows(). Keeping this wrapper prevents
-# NameError on Streamlit/Railway and safely returns an empty DataFrame if
-# ESPN has no boxscore yet.
 def fetch_event_boxscore(event_id: str) -> pd.DataFrame:
+    """Compatibility wrapper used by the DvP engine.
+
+    v1.1 called fetch_event_boxscore() inside build_defense_vs_position(),
+    but the actual ESPN parser helper was named boxscore_player_rows().
+    Keeping this wrapper prevents the Streamlit NameError and safely returns
+    an empty DataFrame if ESPN summary/boxscore data is unavailable.
+    """
     try:
-        if not event_id or str(event_id).lower() in ["nan", "none"]:
+        if not event_id:
             return pd.DataFrame()
         return boxscore_player_rows(str(event_id))
     except Exception as e:
-        log_source_request("ESPN_WNBA_BOXSCORE", "BOX_FETCH_ERROR", str(e))
+        try:
+            log_source_request(f"event_boxscore:{event_id}", "BOX_SCORE_ERROR", str(e))
+        except Exception:
+            pass
         return pd.DataFrame()
+
 # ============================================================
 # PROP LINES — UNDERDOG + PRIZEPICKS
 # ============================================================
