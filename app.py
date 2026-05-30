@@ -45,7 +45,7 @@ try:
 except Exception:
     pytz = None
 
-APP_VERSION = "WNBA_ELITE_PROP_MONEYLINE_ENGINE_v1.2_FIXED_BOXSCORE_ALIAS"
+APP_VERSION = "WNBA_ELITE_PROP_MONEYLINE_ENGINE_v1.5_MATH_SANITY_LINE_DEBUG"
 
 # ============================================================
 # STORAGE
@@ -577,7 +577,8 @@ def get_player_gamelog(player_id: str, season: int = CURRENT_SEASON) -> pd.DataF
         df = df.sort_values("_date", ascending=False).drop(columns=["_date"])
     except Exception:
         pass
-    return df.drop_duplicates(subset=["EventID", "PTS", "REB", "AST"], keep="first")
+    df = df.drop_duplicates(subset=["EventID", "PTS", "REB", "AST"], keep="first")
+    return validate_and_clean_game_log(df)
 
 
 @st.cache_data(ttl=1200, show_spinner=False)
@@ -1059,6 +1060,63 @@ def weighted_recent(series: pd.Series, default: Optional[float] = None) -> Optio
     return sum(v * w for v, w in parts) / total if total else default
 
 
+def weighted_recent_trimmed(series: pd.Series, default: Optional[float] = None, hard_hi: Optional[float] = None) -> Optional[float]:
+    """Recent weighted average with outlier control.
+
+    WNBA projections should not let one mislabeled ESPN row or one spike game control the model.
+    This uses L3/L5/L10 but clips extreme values to a realistic row-level ceiling first.
+    """
+    vals = pd.to_numeric(series, errors="coerce").dropna()
+    if hard_hi is not None:
+        vals = vals[(vals >= 0) & (vals <= hard_hi)]
+    vals = vals.tolist()
+    if not vals:
+        return default
+    if len(vals) >= 6:
+        q1, q3 = np.percentile(vals[:10], [25, 75])
+        iqr = max(q3 - q1, 1.0)
+        hi = q3 + 1.75 * iqr
+        vals = [min(v, hi) for v in vals]
+    l3 = float(np.mean(vals[:3])) if len(vals[:3]) else None
+    l5 = float(np.mean(vals[:5])) if len(vals[:5]) else None
+    l10 = float(np.mean(vals[:10])) if len(vals[:10]) else None
+    parts = []
+    if l3 is not None: parts.append((l3, 0.45))
+    if l5 is not None: parts.append((l5, 0.35))
+    if l10 is not None: parts.append((l10, 0.20))
+    total = sum(w for _, w in parts)
+    return sum(v * w for v, w in parts) / total if total else default
+
+
+def validate_and_clean_game_log(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean ESPN WNBA game logs before model math.
+
+    Fixes iffy projections caused by ESPN stat-list label/order changes. Bad rows are not
+    used for projection math; the app falls back conservative instead of trusting them.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    for c in ["MIN", "PTS", "REB", "AST", "FGA", "FGM", "FTA", "TOV", "STL", "BLK"]:
+        if c not in out.columns:
+            out[c] = np.nan
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    # Row-level WNBA realistic bounds. Anything outside is likely a parse error.
+    out.loc[~out["MIN"].between(1, 45), "MIN"] = np.nan
+    out.loc[~out["PTS"].between(0, 55), "PTS"] = np.nan
+    out.loc[~out["REB"].between(0, 25), "REB"] = np.nan
+    out.loc[~out["AST"].between(0, 18), "AST"] = np.nan
+    out.loc[~out["FGA"].between(0, 35), "FGA"] = np.nan
+    out.loc[~out["FTA"].between(0, 20), "FTA"] = np.nan
+    # Per-minute sanity. This catches swapped columns like rebounds accidentally reading minutes/points.
+    mins = out["MIN"].replace(0, np.nan)
+    out.loc[(out["PTS"] / mins) > 1.45, "PTS"] = np.nan
+    out.loc[(out["REB"] / mins) > 0.72, "REB"] = np.nan
+    out.loc[(out["AST"] / mins) > 0.55, "AST"] = np.nan
+    out = out.dropna(subset=["MIN"], how="any")
+    return out
+
+
 def position_bucket(pos: Any) -> str:
     p = str(pos or "").upper()
     if p in ["PG", "SG", "G"]:
@@ -1194,32 +1252,34 @@ def matchup_factor(opp_abbr: str, market: str, pos_bucket: str, team_stats: Dict
 
 
 def market_projection_cap(market: str, exp_minutes: float) -> float:
-    """Hard sanity cap so bad feed parsing can never create impossible WNBA props."""
-    base_caps = {"Points": 42.0, "Rebounds": 18.0, "Assists": 14.0}
-    cap = base_caps.get(market, 30.0)
-    # Bench/low-minute players should not project like stars even if one bad log row slips in.
-    if exp_minutes < 18:
-        cap *= 0.55
-    elif exp_minutes < 24:
-        cap *= 0.72
-    elif exp_minutes < 30:
-        cap *= 0.88
-    return float(cap)
+    """Realistic hard cap by market and minutes.
+
+    This is not the projected ceiling; it is a safety rail to prevent bad feed rows from
+    creating impossible projections. Stars can still project high, but not absurdly high.
+    """
+    exp_minutes = safe_float(exp_minutes, 24.0) or 24.0
+    if market == "Points":
+        cap = 8.5 + exp_minutes * 0.82
+        return float(clamp(cap, 16.0, 38.5))
+    if market == "Rebounds":
+        cap = 2.5 + exp_minutes * 0.36
+        return float(clamp(cap, 7.0, 15.8))
+    if market == "Assists":
+        cap = 1.5 + exp_minutes * 0.28
+        return float(clamp(cap, 5.5, 11.8))
+    return 30.0
 
 
 def clean_stat_series_for_market(logs: pd.DataFrame, market: str) -> Tuple[pd.Series, pd.Series]:
-    """Return cleaned stat/minute series with WNBA-realistic row-level bounds.
-
-    This fixes the issue where ESPN label/order changes can make rebounds/assists parse
-    into the wrong column and create projections like 40-60 rebounds.
-    """
+    """Return cleaned stat/minute series with WNBA-realistic row-level bounds."""
+    logs = validate_and_clean_game_log(logs)
     stat = STAT_KEYS[market]
     vals = pd.to_numeric(logs.get(stat, pd.Series(dtype=float)), errors="coerce")
     mins = pd.to_numeric(logs.get("MIN", pd.Series(dtype=float)), errors="coerce")
     limits = {
-        "Points": (0, 55, 1.45),
-        "Rebounds": (0, 26, 0.72),
-        "Assists": (0, 18, 0.55),
+        "Points": (0, 55, 1.35),
+        "Rebounds": (0, 24, 0.58),
+        "Assists": (0, 17, 0.46),
     }
     lo, hi, ppm_hi = limits.get(market, (0, 60, 2.0))
     vals = vals.where((vals >= lo) & (vals <= hi))
@@ -1229,47 +1289,67 @@ def clean_stat_series_for_market(logs: pd.DataFrame, market: str) -> Tuple[pd.Se
     return vals, mins
 
 
-def projection_for_market(logs: pd.DataFrame, market: str, exp_minutes: float, pace_fac: float, match_fac: float, learn_scale: float) -> Dict[str, Any]:
-    stat = STAT_KEYS[market]
-    per_min_cap = {"Points": 1.05, "Rebounds": 0.42, "Assists": 0.34}[market]
-    fallback_pm = {"Points": 0.36, "Rebounds": 0.16, "Assists": 0.10}[market]
+def context_multiplier(market: str, pace_fac: float, match_fac: float) -> float:
+    """Apply pace/matchup as a small nudge, not a projection driver."""
+    raw = (safe_float(pace_fac, 1.0) or 1.0) * (safe_float(match_fac, 1.0) or 1.0)
+    caps = {"Points": (0.90, 1.10), "Rebounds": (0.93, 1.07), "Assists": (0.93, 1.07)}
+    lo, hi = caps.get(market, (0.90, 1.10))
+    return float(clamp(raw, lo, hi))
 
+
+def projection_for_market(logs: pd.DataFrame, market: str, exp_minutes: float, pace_fac: float, match_fac: float, learn_scale: float) -> Dict[str, Any]:
+    """Conservative WNBA prop projection.
+
+    Math change from v1.4:
+    - Uses cleaned game logs only.
+    - Blends recent raw stat average with projected per-minute rate.
+    - Context only nudges the number; it cannot multiply a player into an impossible projection.
+    - Learning scale is capped until there are enough graded samples.
+    """
+    stat = STAT_KEYS[market]
+    per_min_cap = {"Points": 0.95, "Rebounds": 0.34, "Assists": 0.26}[market]
+    fallback_pm = {"Points": 0.34, "Rebounds": 0.14, "Assists": 0.085}[market]
+    row_hi = {"Points": 50, "Rebounds": 22, "Assists": 16}[market]
+
+    logs = validate_and_clean_game_log(logs)
     if logs.empty or stat not in logs:
-        per_min = fallback_pm
-        base = exp_minutes * per_min
-        source = "Fallback per-minute"
+        base = exp_minutes * fallback_pm
+        recent_stat = None
+        by_rate = base
+        source = "Conservative fallback per-minute"
     else:
         vals, mins = clean_stat_series_for_market(logs, market)
         per_min_series = (vals / mins.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
-        per_min_series = per_min_series[per_min_series <= per_min_cap]
-        recent_pm = weighted_recent(per_min_series, None)
-        stat_recent = weighted_recent(vals.dropna(), None)
-        if recent_pm is None and stat_recent is None:
-            per_min = fallback_pm
-            base = exp_minutes * per_min
-            source = "Fallback per-minute after stat sanitation"
+        per_min_series = per_min_series[(per_min_series >= 0) & (per_min_series <= per_min_cap)]
+        recent_pm = weighted_recent_trimmed(per_min_series, fallback_pm, hard_hi=per_min_cap)
+        recent_stat = weighted_recent_trimmed(vals.dropna(), None, hard_hi=row_hi)
+        safe_pm = clamp(recent_pm if recent_pm is not None else fallback_pm, 0, per_min_cap)
+        by_rate = exp_minutes * safe_pm
+        if recent_stat is None:
+            base = by_rate
         else:
-            safe_pm = clamp(recent_pm if recent_pm is not None else ((stat_recent or 0) / max(exp_minutes, 1)), 0, per_min_cap)
-            by_rate = exp_minutes * safe_pm
-            # stat_recent can be useful, but cap it to the player's projected-minute context.
-            if stat_recent is not None:
-                stat_recent = min(stat_recent, exp_minutes * per_min_cap * 1.10)
-            by_stat = stat_recent if stat_recent is not None else by_rate
-            base = 0.78 * by_rate + 0.22 * by_stat
-            source = "Sanitized weighted per-minute + recent stat"
+            # Rebounds/assists are more volatile and should lean more on actual recent stat output.
+            weights = {"Points": (0.58, 0.42), "Rebounds": (0.48, 0.52), "Assists": (0.50, 0.50)}[market]
+            base = weights[0] * by_rate + weights[1] * recent_stat
+        source = f"v1.5 cleaned blend: rate {by_rate:.2f}" + (f" + recent {recent_stat:.2f}" if recent_stat is not None else "")
 
-    raw_proj = float(max(0, base * pace_fac * match_fac * learn_scale))
+    ctx = context_multiplier(market, pace_fac, match_fac)
+    safe_learn = clamp(safe_float(learn_scale, 1.0) or 1.0, 0.96, 1.04)
+    raw_proj = float(max(0, base * ctx * safe_learn))
     cap = market_projection_cap(market, exp_minutes)
     proj = float(clamp(raw_proj, 0, cap))
     if raw_proj > cap:
-        source += f" | sanity capped {raw_proj:.2f}->{cap:.2f}"
+        source += f" | cap {raw_proj:.2f}->{cap:.2f}"
+    source += f" | ctx x{ctx:.3f} | learn x{safe_learn:.3f}"
     return {"projection": proj, "source": source}
 
 def volatility_for_market(logs: pd.DataFrame, market: str, exp_minutes: float, min_risk: str) -> float:
     stat = STAT_KEYS[market]
     base = {"Points": 4.2, "Rebounds": 2.4, "Assists": 1.8}[market]
+    logs = validate_and_clean_game_log(logs)
     if not logs.empty and stat in logs:
-        vals = pd.to_numeric(logs[stat], errors="coerce").dropna().head(10).tolist()
+        vals, _mins = clean_stat_series_for_market(logs, market)
+        vals = pd.to_numeric(vals, errors="coerce").dropna().head(10).tolist()
         if len(vals) >= 3:
             base = max(base * 0.65, float(np.std(vals)))
     if "VOLATILE" in min_risk or "INJURY" in min_risk:
@@ -1441,7 +1521,7 @@ def build_prop_board(games: pd.DataFrame, markets: List[str], line_source_pref: 
         player = p.get("player")
         if not player_id or not player:
             continue
-        logs = get_player_gamelog(player_id)
+        logs = validate_and_clean_game_log(get_player_gamelog(player_id))
         min_model = minutes_engine(logs, str(p.get("status") or ""))
         exp_min = min_model["expected_minutes"]
         exp_min, manual_injury_risk, injury_penalty, injury_note = apply_player_injury_adjustment(player, p.get("team_abbr"), exp_min, injury_df)
@@ -1459,9 +1539,12 @@ def build_prop_board(games: pd.DataFrame, markets: List[str], line_source_pref: 
             match_fac, match_note = matchup_factor(p.get("opp_abbr"), market, pos_bucket, team_stats, dvp)
             base_proj = projection_for_market(logs, market, exp_min, pace_fac, match_fac, 1.0)
             if ripple.get("usage_boost", 1.0) > 1.0 and manual_injury_risk != "OUT_MANUAL":
-                base_proj["projection"] *= ripple.get("usage_boost", 1.0)
-                base_proj["source"] += f" + injury ripple usage x{ripple.get('usage_boost', 1.0):.3f}"
+                # Keep redistribution small; missing teammates should nudge, not explode props.
+                ripple_boost = clamp(ripple.get("usage_boost", 1.0), 1.0, {"Points":1.045,"Rebounds":1.025,"Assists":1.035}.get(market,1.035))
+                base_proj["projection"] *= ripple_boost
+                base_proj["source"] += f" + injury ripple x{ripple_boost:.3f}"
             proj, learn_scale = apply_learning(player_id, market, base_proj["projection"])
+            proj = float(clamp(proj, 0, market_projection_cap(market, exp_min)))
             sd = volatility_for_market(logs, market, exp_min, min_model["risk"])
             sims = run_prop_simulation(proj, sd, market)
             p10, median, p90 = np.percentile(sims, [10, 50, 90])
